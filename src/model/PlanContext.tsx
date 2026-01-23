@@ -92,10 +92,18 @@ export const planReducer = (state: FloorPlan, action: Action): FloorPlan => {
 // Context
 interface PlanContextType {
   plan: FloorPlan;
-  dispatch: Dispatch<Action>;
+  dispatch: Dispatch<any>; // Allow history actions
+  undo: () => void;
+  redo: () => void;
+  canUndo: boolean;
+  canRedo: boolean;
 }
 
 export const PlanContext = createContext<PlanContextType>({
   plan: initialPlan,
   dispatch: () => null,
+  undo: () => {},
+  redo: () => {},
+  canUndo: false,
+  canRedo: false,
 });

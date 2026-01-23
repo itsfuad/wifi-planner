@@ -5,9 +5,9 @@ import { WallMaterial, DoorType, ObstacleType, RouterMode, BackhaulType } from '
 
 export const PropertiesPanel: React.FC = () => {
   const { plan, dispatch } = useContext(PlanContext);
-  const { selectedId, simulationResolution, setSimulationResolution } = useUI();
+  const { selectedIds, simulationResolution, setSimulationResolution } = useUI();
 
-  if (!selectedId) {
+  if (selectedIds.size === 0) {
     return (
       <div className="properties-panel">
         <h3>Settings</h3>
@@ -31,10 +31,21 @@ export const PropertiesPanel: React.FC = () => {
     );
   }
 
-  const wall = plan.walls.find((w) => w.id === selectedId);
-  const door = plan.doors.find((d) => d.id === selectedId);
-  const obstacle = plan.obstacles.find((o) => o.id === selectedId);
-  const router = plan.routers.find((r) => r.id === selectedId);
+  if (selectedIds.size > 1) {
+      return (
+          <div className="properties-panel">
+              <h3>Properties</h3>
+              <p>{selectedIds.size} items selected.</p>
+              <p>Multi-edit not supported yet.</p>
+          </div>
+      );
+  }
+
+  const id = Array.from(selectedIds)[0];
+  const wall = plan.walls.find((w) => w.id === id);
+  const door = plan.doors.find((d) => d.id === id);
+  const obstacle = plan.obstacles.find((o) => o.id === id);
+  const router = plan.routers.find((r) => r.id === id);
 
   return (
     <div className="properties-panel">

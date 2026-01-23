@@ -9,8 +9,10 @@ export interface UIContextType {
   setScale: (scale: number) => void;
   gridSize: number; // in cm (pixels)
   setGridSize: (size: number) => void;
-  selectedId: string | null;
-  setSelectedId: (id: string | null) => void;
+  selectedIds: Set<string>;
+  setSelectedIds: (ids: Set<string>) => void;
+  toggleSelection: (id: string) => void;
+  clearSelection: () => void;
   simulationResolution: number;
   setSimulationResolution: (res: number) => void;
 }
@@ -20,10 +22,12 @@ export const UIContext = createContext<UIContextType>({
   setActiveTool: () => {},
   scale: 1,
   setScale: () => {},
-  gridSize: 50, // 50 cm
+  gridSize: 50,
   setGridSize: () => {},
-  selectedId: null,
-  setSelectedId: () => {},
+  selectedIds: new Set(),
+  setSelectedIds: () => {},
+  toggleSelection: () => {},
+  clearSelection: () => {},
   simulationResolution: 20,
   setSimulationResolution: () => {},
 });

@@ -4,7 +4,7 @@ import { PropertiesPanel } from './ui/PropertiesPanel';
 import { PlanProvider } from './model/PlanProvider';
 import { UIProvider } from './ui/UIProvider';
 import { useSimulation } from './sim/useSimulation';
-import { useContext, useRef } from 'react';
+import { useContext, useRef, useEffect } from 'react';
 import { PlanContext } from './model/PlanContext';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -12,10 +12,26 @@ import { useUI } from './ui/UIContext';
 
 // Wrapper component to access Context
 const AppContent = () => {
-    const { plan, dispatch } = useContext(PlanContext);
+    const { plan, dispatch, undo, redo } = useContext(PlanContext);
     const { simulationResolution } = useUI();
     const { isSimulating, result, runSimulation } = useSimulation();
     const fileInputRef = useRef<HTMLInputElement>(null);
+
+    // Keyboard shortcuts
+    useEffect(() => {
+        const handleKeyDown = (e: KeyboardEvent) => {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+                e.preventDefault();
+                undo();
+            }
+            if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.shiftKey && e.key === 'Z'))) {
+                e.preventDefault();
+                redo();
+            }
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [undo, redo]);
 
     const handleRunSimulation = () => {
         runSimulation(plan, simulationResolution);
