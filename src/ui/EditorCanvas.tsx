@@ -4,11 +4,12 @@ import { PlanContext } from '../model/PlanContext';
 import { useUI } from './UIContext';
 import { v4 as uuidv4 } from 'uuid';
 import type { Point } from '../model/types';
-import { WallMaterial, ObstacleType, DoorType } from '../model/types';
+import { WallMaterial, ObstacleType, DoorType, RouterMode, BackhaulType } from '../model/types';
 import { distance, getNearestPointOnSegment } from '../utils/math';
 import Konva from 'konva';
 import type { SimulationResponse } from '../sim/worker';
 import { Heatmap } from './Heatmap';
+import { calculateBackhaulRSSI, getSignalQualityColor } from '../utils/signal';
 
 interface EditorCanvasProps {
     simulationResult?: SimulationResponse | null;
@@ -99,6 +100,29 @@ export const EditorCanvas: React.FC<EditorCanvasProps> = ({ simulationResult }) 
     return Math.round(val / gridSize) * gridSize;
   };
 
+  const snapToWallEndpoint = (pos: Point) => {
+      // Check existing wall endpoints
+      const threshold = 20; // px
+      let closest: Point | null = null;
+      let minDst = Infinity;
+
+      for (const wall of plan.walls) {
+          const d1 = distance(wall.p1, pos);
+          if (d1 < threshold && d1 < minDst) {
+              minDst = d1;
+              closest = wall.p1;
+          }
+           const d2 = distance(wall.p2, pos);
+          if (d2 < threshold && d2 < minDst) {
+              minDst = d2;
+              closest = wall.p2;
+          }
+      }
+
+      if (closest) return closest;
+      return { x: snapToGrid(pos.x), y: snapToGrid(pos.y) };
+  };
+
   const getStagePointerPosition = (stage: Konva.Stage) => {
     const pointer = stage.getPointerPosition();
     if (!pointer) return null;
@@ -165,8 +189,10 @@ export const EditorCanvas: React.FC<EditorCanvasProps> = ({ simulationResult }) 
                 band: 5, // 5 GHz default
                 gain: 2, // 2 dBi default
                 ssid: `AP-${plan.routers.length + 1}`,
-                isMesh: false,
-                meshParentId: null
+                mode: RouterMode.Solo,
+                meshParentId: null,
+                backhaulType: BackhaulType.Wireless,
+                backhaulBand: 5
             }
         });
         return;
@@ -194,7 +220,7 @@ export const EditorCanvas: React.FC<EditorCanvasProps> = ({ simulationResult }) 
 
     if (activeTool !== 'wall' && activeTool !== 'obstacle') return;
 
-    const snapedPos = { x: snapToGrid(pos.x), y: snapToGrid(pos.y) };
+    const snapedPos = activeTool === 'wall' ? snapToWallEndpoint(pos) : { x: snapToGrid(pos.x), y: snapToGrid(pos.y) };
 
     setIsDrawing(true);
     setStartPoint(snapedPos);
@@ -261,7 +287,7 @@ export const EditorCanvas: React.FC<EditorCanvasProps> = ({ simulationResult }) 
 
     if (!isDrawing) return;
 
-    const snapedPos = { x: snapToGrid(pos.x), y: snapToGrid(pos.y) };
+    const snapedPos = activeTool === 'wall' ? snapToWallEndpoint(pos) : { x: snapToGrid(pos.x), y: snapToGrid(pos.y) };
     setCurrentPoint(snapedPos);
   };
 
@@ -382,6 +408,23 @@ export const EditorCanvas: React.FC<EditorCanvasProps> = ({ simulationResult }) 
                             setSelectedId(wall.id);
                         }
                     }}
+                    draggable={activeTool === 'select'}
+                    onDragEnd={(e) => {
+                         const dx = e.target.x();
+                         const dy = e.target.y();
+                         // Reset position relative to shape and update points
+                         e.target.x(0);
+                         e.target.y(0);
+
+                         dispatch({
+                            type: 'UPDATE_WALL',
+                            payload: {
+                                ...wall,
+                                p1: { x: wall.p1.x + dx, y: wall.p1.y + dy },
+                                p2: { x: wall.p2.x + dx, y: wall.p2.y + dy }
+                            }
+                        })
+                    }}
                   />
             </React.Fragment>
           ))}
@@ -491,48 +534,88 @@ export const EditorCanvas: React.FC<EditorCanvasProps> = ({ simulationResult }) 
              </Group>
           ))}
 
-          {plan.routers.map((router) => (
-              <Group
-                key={router.id}
-                id={router.id}
-                name="router"
-                x={router.x}
-                y={router.y}
-                draggable={activeTool === 'select'}
-                onClick={(e) => {
-                    if (activeTool === 'select') {
-                        e.cancelBubble = true;
-                        setSelectedId(router.id);
-                    }
-                }}
-                onDragEnd={(e) => {
-                     dispatch({
-                        type: 'UPDATE_ROUTER',
-                        payload: {
-                            ...router,
-                            x: e.target.x(),
-                            y: e.target.y(),
+          {plan.routers.map((router) => {
+              // Calculate Backhaul if Mesh Node
+              let backhaulColor = '#00aa00';
+              let parentNode = null;
+
+              if (router.mode === RouterMode.MeshNode && router.meshParentId) {
+                  parentNode = plan.routers.find(r => r.id === router.meshParentId);
+                  const rssi = calculateBackhaulRSSI(router.id, plan);
+                  backhaulColor = router.backhaulType === BackhaulType.Wired ? '#000000' : getSignalQualityColor(rssi);
+              }
+
+              return (
+              <React.Fragment key={router.id}>
+                  {/* Draw link to parent */}
+                  {parentNode && (
+                      <Line
+                        points={[parentNode.x, parentNode.y, router.x, router.y]}
+                        stroke={backhaulColor}
+                        strokeWidth={2}
+                        dash={router.backhaulType === BackhaulType.Wired ? [] : [5, 5]}
+                        listening={false}
+                      />
+                  )}
+
+                  <Group
+                    id={router.id}
+                    name="router"
+                    x={router.x}
+                    y={router.y}
+                    draggable={activeTool === 'select'}
+                    onClick={(e) => {
+                        if (activeTool === 'select') {
+                            e.cancelBubble = true;
+                            setSelectedId(router.id);
                         }
-                    })
-                }}
-              >
-                 <Circle
-                    radius={15}
-                    fill={selectedId === router.id ? '#00ff00' : '#00aa00'}
-                    stroke="#000"
-                    strokeWidth={1}
-                 />
-                 <Text
-                    text={router.ssid}
-                    y={20}
-                    align="center"
-                    fontSize={12}
-                    fill="#000"
-                    offsetX={router.ssid.length * 3}
-                 />
-                 <Circle radius={3} fill="#fff" />
-              </Group>
-          ))}
+                    }}
+                    onDragEnd={(e) => {
+                        dispatch({
+                            type: 'UPDATE_ROUTER',
+                            payload: {
+                                ...router,
+                                x: e.target.x(),
+                                y: e.target.y(),
+                            }
+                        })
+                    }}
+                  >
+                    <Circle
+                        radius={15}
+                        fill={selectedId === router.id ? '#ccffcc' : '#ffffff'}
+                        stroke={router.mode === RouterMode.MeshRoot ? '#0000aa' : '#00aa00'}
+                        strokeWidth={router.mode === RouterMode.MeshRoot ? 3 : 2}
+                    />
+
+                    {/* Inner Indicator for Backhaul Quality or Mode */}
+                    <Circle
+                        radius={8}
+                        fill={router.mode === RouterMode.MeshNode ? backhaulColor : (router.mode === RouterMode.MeshRoot ? '#0000aa' : '#00aa00')}
+                    />
+
+                    <Text
+                        text={router.ssid}
+                        y={20}
+                        align="center"
+                        fontSize={12}
+                        fill="#000"
+                        offsetX={router.ssid.length * 3}
+                    />
+                    <Text
+                        text={router.mode === RouterMode.MeshRoot ? 'R' : router.mode === RouterMode.MeshNode ? 'N' : 'S'}
+                        align="center"
+                        verticalAlign="middle"
+                        fontSize={10}
+                        fill="#fff"
+                        x={-3}
+                        y={-4}
+                        listening={false}
+                    />
+                  </Group>
+              </React.Fragment>
+              );
+          })}
 
            {/* Transformer for selected objects */}
             <Transformer

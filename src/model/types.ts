@@ -59,6 +59,21 @@ export interface Obstacle {
   label: string;
 }
 
+export const RouterMode = {
+    Solo: 'solo',
+    MeshRoot: 'mesh_root',
+    MeshNode: 'mesh_node',
+} as const;
+
+export type RouterMode = (typeof RouterMode)[keyof typeof RouterMode];
+
+export const BackhaulType = {
+    Wireless: 'wireless',
+    Wired: 'wired',
+} as const;
+
+export type BackhaulType = (typeof BackhaulType)[keyof typeof BackhaulType];
+
 export interface Router {
   id: string;
   x: number;
@@ -67,8 +82,10 @@ export interface Router {
   band: 2.4 | 5 | 6; // GHz
   gain: number; // dBi
   ssid: string;
-  isMesh: boolean;
+  mode: RouterMode;
   meshParentId: string | null;
+  backhaulType: BackhaulType;
+  backhaulBand: 2.4 | 5 | 6 | null; // GHz, null if wired or auto (but we'll make it explicit)
 }
 
 export interface FloorPlan {

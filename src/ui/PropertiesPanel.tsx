@@ -1,7 +1,7 @@
 import React, { useContext } from 'react';
 import { PlanContext } from '../model/PlanContext';
 import { useUI } from './UIContext';
-import { WallMaterial, DoorType, ObstacleType } from '../model/types';
+import { WallMaterial, DoorType, ObstacleType, RouterMode, BackhaulType } from '../model/types';
 
 export const PropertiesPanel: React.FC = () => {
   const { plan, dispatch } = useContext(PlanContext);
@@ -207,6 +207,72 @@ export const PropertiesPanel: React.FC = () => {
                 onChange={(e) => dispatch({ type: 'UPDATE_ROUTER', payload: { ...router, gain: Number(e.target.value) } })}
                />
            </label>
+           <br/>
+           <label>
+               Mode:
+               <select
+                 value={router.mode || RouterMode.Solo}
+                 onChange={(e) => {
+                     const newMode = e.target.value as RouterMode;
+                     dispatch({ type: 'UPDATE_ROUTER', payload: { ...router, mode: newMode, meshParentId: newMode === RouterMode.MeshNode ? router.meshParentId : null } });
+                 }}
+               >
+                   <option value={RouterMode.Solo}>Solo Router</option>
+                   <option value={RouterMode.MeshRoot}>Mesh Root</option>
+                   <option value={RouterMode.MeshNode}>Mesh Satellite</option>
+               </select>
+           </label>
+
+           {router.mode === RouterMode.MeshNode && (
+               <>
+                   <br/>
+                   <label>
+                       Uplink Parent:
+                       <select
+                         value={router.meshParentId || ''}
+                         onChange={(e) => dispatch({ type: 'UPDATE_ROUTER', payload: { ...router, meshParentId: e.target.value || null } })}
+                       >
+                           <option value="">-- Select Parent --</option>
+                           {plan.routers
+                               .filter(r => r.id !== router.id && r.mode !== RouterMode.MeshNode)
+                               .map(r => (
+                                   <option key={r.id} value={r.id}>
+                                       {r.ssid || r.id}
+                                   </option>
+                               ))
+                           }
+                       </select>
+                   </label>
+                   <br/>
+                   <label>
+                       Backhaul Type:
+                       <select
+                         value={router.backhaulType || BackhaulType.Wireless}
+                         onChange={(e) => dispatch({ type: 'UPDATE_ROUTER', payload: { ...router, backhaulType: e.target.value as BackhaulType } })}
+                       >
+                           <option value={BackhaulType.Wireless}>Wireless</option>
+                           <option value={BackhaulType.Wired}>Wired (Ethernet)</option>
+                       </select>
+                   </label>
+
+                   {router.backhaulType === BackhaulType.Wireless && (
+                       <>
+                           <br/>
+                           <label>
+                               Backhaul Band (GHz):
+                               <select
+                                 value={router.backhaulBand || 5}
+                                 onChange={(e) => dispatch({ type: 'UPDATE_ROUTER', payload: { ...router, backhaulBand: Number(e.target.value) as 2.4 | 5 | 6 } })}
+                               >
+                                   <option value={2.4}>2.4</option>
+                                   <option value={5}>5</option>
+                                   <option value={6}>6</option>
+                               </select>
+                           </label>
+                       </>
+                   )}
+               </>
+           )}
         </div>
       )}
     </div>
