@@ -1,245 +1,524 @@
-import React, { useRef, useState, useEffect, useContext, useMemo } from 'react';
-import { Stage, Layer, Line, Rect, Group, Text, Transformer, Circle, Label, Tag } from 'react-konva';
-import { PlanContext } from '../model/PlanContext';
-import { useUI } from './UIContext';
-import { v4 as uuidv4 } from 'uuid';
-import type { Point } from '../model/types';
-import { WallMaterial, ObstacleType, DoorType, RouterMode, BackhaulType } from '../model/types';
-import { distance, getNearestPointOnSegment } from '../utils/math';
+import React, { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { Circle, Group, Label, Layer, Line, Rect, Stage, Tag, Text, Transformer } from 'react-konva';
+import { Crosshair, Maximize2, Minus, Plus } from 'lucide-react';
 import Konva from 'konva';
+import { v4 as uuidv4 } from 'uuid';
+import { PlanContext } from '../model/PlanContext';
+import type { Door, FloorPlan, Obstacle, Point, Router, Wall } from '../model/types';
+import { BackhaulType, DoorType, ObstacleType, RouterMode, WallMaterial } from '../model/types';
 import type { SimulationResponse } from '../sim/worker';
-import { Heatmap } from './Heatmap';
+import { distance, getNearestPointOnSegment } from '../utils/math';
 import { calculateBackhaulRSSI, getSignalQualityColor } from '../utils/signal';
+import { Heatmap } from './Heatmap';
+import { useUI } from './UIContext';
+
+type Box = { x: number; y: number; width: number; height: number };
+type DragSession = { start: Point; ids: Set<string>; primaryId: string; moved: boolean };
 
 interface EditorCanvasProps {
-    simulationResult?: SimulationResponse | null;
+  simulationResult?: SimulationResponse | null;
 }
+
+const boxesIntersect = (a: Box, b: Box) =>
+  a.x <= b.x + b.width && a.x + a.width >= b.x && a.y <= b.y + b.height && a.y + a.height >= b.y;
+
+const normalizeBox = (box: Box): Box => ({
+  x: box.width < 0 ? box.x + box.width : box.x,
+  y: box.height < 0 ? box.y + box.height : box.y,
+  width: Math.abs(box.width),
+  height: Math.abs(box.height),
+});
+
+const pointKey = (p: Point) => `${p.x},${p.y}`;
+
+const obstacleBounds = (obs: Obstacle): Box => {
+  if (!obs.rotation) return { x: obs.x, y: obs.y, width: obs.width, height: obs.height };
+  const r = obs.rotation * Math.PI / 180;
+  const c = Math.cos(r);
+  const s = Math.sin(r);
+  const pts = [
+    { x: 0, y: 0 },
+    { x: obs.width, y: 0 },
+    { x: obs.width, y: obs.height },
+    { x: 0, y: obs.height },
+  ].map((p) => ({ x: obs.x + p.x * c - p.y * s, y: obs.y + p.x * s + p.y * c }));
+  const xs = pts.map((p) => p.x);
+  const ys = pts.map((p) => p.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+};
+
+const wallBounds = (wall: Wall): Box => {
+  const pad = Math.max(8, wall.thickness / 2 + 4);
+  const x = Math.min(wall.p1.x, wall.p2.x) - pad;
+  const y = Math.min(wall.p1.y, wall.p2.y) - pad;
+  return {
+    x,
+    y,
+    width: Math.abs(wall.p2.x - wall.p1.x) + pad * 2,
+    height: Math.abs(wall.p2.y - wall.p1.y) + pad * 2,
+  };
+};
+
+const routerBounds = (router: Router): Box => ({ x: router.x - 24, y: router.y - 24, width: 48, height: 58 });
+
+const doorCenter = (door: Door, wall: Wall): Point => {
+  const len = distance(wall.p1, wall.p2) || 1;
+  const ux = (wall.p2.x - wall.p1.x) / len;
+  const uy = (wall.p2.y - wall.p1.y) / len;
+  return { x: wall.p1.x + ux * door.distance, y: wall.p1.y + uy * door.distance };
+};
+
+const doorBounds = (door: Door, wall: Wall): Box => {
+  const center = doorCenter(door, wall);
+  const len = distance(wall.p1, wall.p2) || 1;
+  const ux = (wall.p2.x - wall.p1.x) / len;
+  const uy = (wall.p2.y - wall.p1.y) / len;
+  const half = door.width / 2;
+  const p1 = { x: center.x - ux * half, y: center.y - uy * half };
+  const p2 = { x: center.x + ux * half, y: center.y + uy * half };
+  const pad = Math.max(10, wall.thickness / 2 + 4);
+  return {
+    x: Math.min(p1.x, p2.x) - pad,
+    y: Math.min(p1.y, p2.y) - pad,
+    width: Math.abs(p2.x - p1.x) + pad * 2,
+    height: Math.abs(p2.y - p1.y) + pad * 2,
+  };
+};
+
+const allEntityIds = (plan: FloorPlan) => [
+  ...plan.walls.map((x) => x.id),
+  ...plan.doors.map((x) => x.id),
+  ...plan.obstacles.map((x) => x.id),
+  ...plan.routers.map((x) => x.id),
+];
 
 export const EditorCanvas: React.FC<EditorCanvasProps> = ({ simulationResult }) => {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [size, setSize] = useState({ width: 0, height: 0 });
-  const { plan, dispatch } = useContext(PlanContext);
-  const { activeTool, gridSize, selectedIds, setSelectedIds, toggleSelection, clearSelection, scale, setScale } = useUI();
+  const stageRef = useRef<Konva.Stage>(null);
+  const transformerRef = useRef<Konva.Transformer>(null);
+  const layerRef = useRef<Konva.Layer>(null);
+  const dragSessionRef = useRef<DragSession | null>(null);
+  const lastFitPlanId = useRef<string | null>(null);
 
-  // Drawing state
+  const [size, setSize] = useState({ width: 0, height: 0 });
   const [isDrawing, setIsDrawing] = useState(false);
   const [startPoint, setStartPoint] = useState<Point | null>(null);
   const [currentPoint, setCurrentPoint] = useState<Point | null>(null);
-
-  // Selection Box
-  const [selectionBox, setSelectionBox] = useState<{x: number, y: number, width: number, height: number} | null>(null);
-
-  // Door preview state
+  const [selectionBox, setSelectionBox] = useState<Box | null>(null);
+  const [selectionAdditive, setSelectionAdditive] = useState(false);
+  const [dragDelta, setDragDelta] = useState<Point>({ x: 0, y: 0 });
   const [hoveredWallId, setHoveredWallId] = useState<string | null>(null);
   const [doorPreviewPos, setDoorPreviewPos] = useState<Point | null>(null);
+  const [tooltip, setTooltip] = useState<{ x: number; y: number; text: string } | null>(null);
+  const [isSpacePressed, setIsSpacePressed] = useState(false);
 
-  const transformerRef = useRef<Konva.Transformer>(null);
-  const layerRef = useRef<Konva.Layer>(null);
-
-  // Tooltip state
-  const [tooltip, setTooltip] = useState<{x: number, y: number, text: string} | null>(null);
+  const { plan, dispatch } = useContext(PlanContext);
+  const {
+    activeTool, setActiveTool, gridSize, selectedIds, setSelectedIds, clearSelection,
+    scale, setScale, showGrid, showHeatmap, heatmapOpacity,
+  } = useUI();
 
   useEffect(() => {
     const resize = () => {
-      if (containerRef.current) {
-        setSize({
-          width: containerRef.current.offsetWidth,
-          height: containerRef.current.offsetHeight,
-        });
-      }
+      if (!containerRef.current) return;
+      setSize({ width: containerRef.current.offsetWidth, height: containerRef.current.offsetHeight });
     };
     resize();
+    const observer = new ResizeObserver(resize);
+    if (containerRef.current) observer.observe(containerRef.current);
     window.addEventListener('resize', resize);
-    return () => window.removeEventListener('resize', resize);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', resize);
+    };
   }, []);
 
-  // Key press for delete
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIds.size > 0) {
-        selectedIds.forEach(id => {
-            if (plan.walls.some(w => w.id === id)) {
-                dispatch({ type: 'DELETE_WALL', payload: id });
-            } else if (plan.obstacles.some(o => o.id === id)) {
-                 dispatch({ type: 'DELETE_OBSTACLE', payload: id });
-            } else if (plan.doors.some(d => d.id === id)) {
-                 dispatch({ type: 'DELETE_DOOR', payload: id });
-            } else if (plan.routers.some(r => r.id === id)) {
-                dispatch({ type: 'DELETE_ROUTER', payload: id });
-            }
-        });
-        clearSelection();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedIds, plan, dispatch, clearSelection]);
+  const snapToGrid = useCallback((value: number) => Math.round(value / gridSize) * gridSize, [gridSize]);
 
-  // Update Transformer selection
-  useEffect(() => {
-    if (selectedIds.size > 0 && transformerRef.current) {
-        const stage = transformerRef.current.getStage();
-        if (stage) {
-             const nodes: Konva.Node[] = [];
-             selectedIds.forEach(id => {
-                 const node = stage.findOne('#' + id);
-                 if (node && (node instanceof Konva.Group || node instanceof Konva.Circle)) {
-                     nodes.push(node);
-                 }
-             });
-
-             transformerRef.current.nodes(nodes);
-             transformerRef.current.getLayer()?.batchDraw();
-        }
-    } else if (transformerRef.current) {
-        transformerRef.current.nodes([]);
-    }
-  }, [selectedIds, plan]);
-
-
-  const snapToGrid = (val: number) => {
-    return Math.round(val / gridSize) * gridSize;
-  };
-
-  const snapToWallEndpoint = (pos: Point) => {
-      // Check existing wall endpoints
-      const threshold = 20; // px
-      let closest: Point | null = null;
-      let minDst = Infinity;
-
-      for (const wall of plan.walls) {
-          const d1 = distance(wall.p1, pos);
-          if (d1 < threshold && d1 < minDst) {
-              minDst = d1;
-              closest = wall.p1;
-          }
-           const d2 = distance(wall.p2, pos);
-          if (d2 < threshold && d2 < minDst) {
-              minDst = d2;
-              closest = wall.p2;
-          }
-      }
-
-      if (closest) return closest;
-      return { x: snapToGrid(pos.x), y: snapToGrid(pos.y) };
-  };
-
-  const getStagePointerPosition = (stage: Konva.Stage) => {
+  const getStagePointerPosition = useCallback((stage: Konva.Stage): Point | null => {
     const pointer = stage.getPointerPosition();
     if (!pointer) return null;
     const stageScale = stage.scaleX();
-    const position = stage.position();
+    return { x: (pointer.x - stage.x()) / stageScale, y: (pointer.y - stage.y()) / stageScale };
+  }, []);
+
+  const snapToWallEndpoint = useCallback((pos: Point) => {
+    const threshold = Math.max(14, 18 / Math.max(scale, .25));
+    let closest: Point | null = null;
+    let minDistance = Infinity;
+    plan.walls.forEach((wall) => {
+      [wall.p1, wall.p2].forEach((point) => {
+        const d = distance(point, pos);
+        if (d < threshold && d < minDistance) {
+          minDistance = d;
+          closest = point;
+        }
+      });
+    });
+    return closest ?? { x: snapToGrid(pos.x), y: snapToGrid(pos.y) };
+  }, [plan.walls, scale, snapToGrid]);
+
+  const getEntityAnchor = useCallback((id: string): Point | null => {
+    const wall = plan.walls.find((x) => x.id === id);
+    if (wall) return wall.p1;
+    const obs = plan.obstacles.find((x) => x.id === id);
+    if (obs) return { x: obs.x, y: obs.y };
+    const router = plan.routers.find((x) => x.id === id);
+    if (router) return { x: router.x, y: router.y };
+    const door = plan.doors.find((x) => x.id === id);
+    if (door) {
+      const parent = plan.walls.find((x) => x.id === door.wallId);
+      if (parent) return doorCenter(door, parent);
+    }
+    return null;
+  }, [plan]);
+
+  const snapDragDelta = useCallback((session: DragSession, delta: Point) => {
+    const anchor = getEntityAnchor(session.primaryId);
+    if (!anchor) return delta;
     return {
-      x: (pointer.x - position.x) / stageScale,
-      y: (pointer.y - position.y) / stageScale,
+      x: snapToGrid(anchor.x + delta.x) - anchor.x,
+      y: snapToGrid(anchor.y + delta.y) - anchor.y,
     };
-  };
+  }, [getEntityAnchor, snapToGrid]);
+
+  const selectedWallEndpointKeys = useMemo(() => {
+    const keys = new Set<string>();
+    const ids = dragSessionRef.current?.ids ?? selectedIds;
+    plan.walls.forEach((wall) => {
+      if (!ids.has(wall.id)) return;
+      keys.add(pointKey(wall.p1));
+      keys.add(pointKey(wall.p2));
+    });
+    return keys;
+  }, [plan.walls, selectedIds, dragDelta]);
+
+  const activeDragIds = dragSessionRef.current?.ids ?? new Set<string>();
+
+  const previewWall = useCallback((wall: Wall): Wall => {
+    if (!dragSessionRef.current || (!dragDelta.x && !dragDelta.y)) return wall;
+    const move = (p: Point) => ({ x: p.x + dragDelta.x, y: p.y + dragDelta.y });
+    if (activeDragIds.has(wall.id)) return { ...wall, p1: move(wall.p1), p2: move(wall.p2) };
+    const p1 = selectedWallEndpointKeys.has(pointKey(wall.p1)) ? move(wall.p1) : wall.p1;
+    const p2 = selectedWallEndpointKeys.has(pointKey(wall.p2)) ? move(wall.p2) : wall.p2;
+    return p1 === wall.p1 && p2 === wall.p2 ? wall : { ...wall, p1, p2 };
+  }, [activeDragIds, dragDelta, selectedWallEndpointKeys]);
+
+  const previewRouter = useCallback((router: Router): Router => {
+    if (!activeDragIds.has(router.id)) return router;
+    return { ...router, x: router.x + dragDelta.x, y: router.y + dragDelta.y };
+  }, [activeDragIds, dragDelta]);
+
+  const previewObstacle = useCallback((obs: Obstacle): Obstacle => {
+    if (!activeDragIds.has(obs.id)) return obs;
+    return { ...obs, x: obs.x + dragDelta.x, y: obs.y + dragDelta.y };
+  }, [activeDragIds, dragDelta]);
+
+  const previewDoor = useCallback((door: Door) => {
+    const originalWall = plan.walls.find((x) => x.id === door.wallId);
+    if (!originalWall) return null;
+    const wall = previewWall(originalWall);
+    let distanceAlong = door.distance;
+    if (activeDragIds.has(door.id) && !activeDragIds.has(door.wallId)) {
+      const len = distance(originalWall.p1, originalWall.p2) || 1;
+      const ux = (originalWall.p2.x - originalWall.p1.x) / len;
+      const uy = (originalWall.p2.y - originalWall.p1.y) / len;
+      const projected = dragDelta.x * ux + dragDelta.y * uy;
+      const half = door.width / 2;
+      distanceAlong = Math.max(half, Math.min(len - half, door.distance + projected));
+    }
+    const len = distance(wall.p1, wall.p2) || 1;
+    const ux = (wall.p2.x - wall.p1.x) / len;
+    const uy = (wall.p2.y - wall.p1.y) / len;
+    return {
+      wall,
+      distance: distanceAlong,
+      x: wall.p1.x + ux * distanceAlong,
+      y: wall.p1.y + uy * distanceAlong,
+      angle: Math.atan2(uy, ux) * 180 / Math.PI,
+    };
+  }, [activeDragIds, dragDelta, plan.walls, previewWall]);
+
+  const entityBounds = useCallback((id: string): Box | null => {
+    const wall = plan.walls.find((x) => x.id === id);
+    if (wall) return wallBounds(wall);
+    const obs = plan.obstacles.find((x) => x.id === id);
+    if (obs) return obstacleBounds(obs);
+    const router = plan.routers.find((x) => x.id === id);
+    if (router) return routerBounds(router);
+    const door = plan.doors.find((x) => x.id === id);
+    if (door) {
+      const parent = plan.walls.find((x) => x.id === door.wallId);
+      if (parent) return doorBounds(door, parent);
+    }
+    return null;
+  }, [plan]);
+
+  const selectionBounds = useMemo(() => {
+    if (selectedIds.size < 2) return null;
+    const boxes = [...selectedIds].map(entityBounds).filter((x): x is Box => !!x);
+    if (!boxes.length) return null;
+    const minX = Math.min(...boxes.map((x) => x.x));
+    const minY = Math.min(...boxes.map((x) => x.y));
+    const maxX = Math.max(...boxes.map((x) => x.x + x.width));
+    const maxY = Math.max(...boxes.map((x) => x.y + x.height));
+    const offset = dragSessionRef.current ? dragDelta : { x: 0, y: 0 };
+    return { x: minX + offset.x, y: minY + offset.y, width: maxX - minX, height: maxY - minY };
+  }, [dragDelta, entityBounds, selectedIds]);
+
+  const beginEntityPointer = useCallback((id: string, e: Konva.KonvaEventObject<MouseEvent>) => {
+    if (activeTool !== 'select') return;
+    e.cancelBubble = true;
+    const stage = e.target.getStage();
+    if (!stage) return;
+    const pos = getStagePointerPosition(stage);
+    if (!pos) return;
+    const additive = e.evt.shiftKey || e.evt.ctrlKey || e.evt.metaKey;
+    let next = new Set(selectedIds);
+
+    if (additive) {
+      if (next.has(id)) {
+        next.delete(id);
+        setSelectedIds(next);
+        dragSessionRef.current = null;
+        return;
+      }
+      next.add(id);
+      setSelectedIds(next);
+    } else if (!next.has(id)) {
+      next = new Set([id]);
+      setSelectedIds(next);
+    }
+
+    dragSessionRef.current = { start: pos, ids: next, primaryId: id, moved: false };
+    setDragDelta({ x: 0, y: 0 });
+  }, [activeTool, getStagePointerPosition, selectedIds, setSelectedIds]);
+
+  const duplicateSelection = useCallback(() => {
+    if (!selectedIds.size) return;
+    const selected = new Set(selectedIds);
+    const offset = gridSize;
+    const wallIdMap = new Map<string, string>();
+    const routerIdMap = new Map<string, string>();
+    const newIds = new Set<string>();
+
+    const newWalls = plan.walls.filter((w) => selected.has(w.id)).map((w) => {
+      const id = uuidv4();
+      wallIdMap.set(w.id, id);
+      newIds.add(id);
+      return { ...w, id, p1: { x: w.p1.x + offset, y: w.p1.y + offset }, p2: { x: w.p2.x + offset, y: w.p2.y + offset } };
+    });
+    const newObstacles = plan.obstacles.filter((o) => selected.has(o.id)).map((o) => {
+      const id = uuidv4(); newIds.add(id);
+      return { ...o, id, x: o.x + offset, y: o.y + offset };
+    });
+    const newRouters = plan.routers.filter((r) => selected.has(r.id)).map((r) => {
+      const id = uuidv4(); routerIdMap.set(r.id, id); newIds.add(id);
+      return { ...r, id, x: r.x + offset, y: r.y + offset };
+    });
+    const newDoors: Door[] = [];
+    plan.doors.forEach((d) => {
+      const clonedParent = wallIdMap.get(d.wallId);
+      if (clonedParent) {
+        const id = uuidv4(); newIds.add(id);
+        newDoors.push({ ...d, id, wallId: clonedParent });
+      } else if (selected.has(d.id)) {
+        const wall = plan.walls.find((w) => w.id === d.wallId);
+        const length = wall ? distance(wall.p1, wall.p2) : Infinity;
+        const id = uuidv4(); newIds.add(id);
+        newDoors.push({ ...d, id, distance: Math.min(length - d.width / 2, d.distance + offset) });
+      }
+    });
+    const remappedRouters = newRouters.map((r) => r.meshParentId && routerIdMap.has(r.meshParentId)
+      ? { ...r, meshParentId: routerIdMap.get(r.meshParentId)! }
+      : r);
+
+    dispatch({
+      type: 'SET_PLAN',
+      payload: {
+        ...plan,
+        walls: [...plan.walls, ...newWalls],
+        doors: [...plan.doors, ...newDoors],
+        obstacles: [...plan.obstacles, ...newObstacles],
+        routers: [...plan.routers, ...remappedRouters],
+      },
+    });
+    setSelectedIds(newIds);
+  }, [dispatch, gridSize, plan, selectedIds, setSelectedIds]);
+
+  useEffect(() => {
+    const keyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const editing = target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName);
+      if (e.code === 'Space' && !editing) {
+        e.preventDefault();
+        setIsSpacePressed(true);
+      }
+      if (editing) return;
+
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIds.size) {
+        e.preventDefault();
+        dispatch({ type: 'DELETE_ENTITIES', payload: [...selectedIds] });
+        clearSelection();
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
+        e.preventDefault();
+        setSelectedIds(new Set(allEntityIds(plan)));
+        setActiveTool('select');
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'd' && selectedIds.size) {
+        e.preventDefault();
+        duplicateSelection();
+        return;
+      }
+      if (activeTool === 'select' && selectedIds.size && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) {
+        e.preventDefault();
+        const amount = e.shiftKey ? gridSize : 10;
+        const dx = e.key === 'ArrowLeft' ? -amount : e.key === 'ArrowRight' ? amount : 0;
+        const dy = e.key === 'ArrowUp' ? -amount : e.key === 'ArrowDown' ? amount : 0;
+        dispatch({ type: 'TRANSLATE_ENTITIES', payload: { ids: [...selectedIds], dx, dy } });
+      }
+    };
+    const keyUp = (e: KeyboardEvent) => { if (e.code === 'Space') setIsSpacePressed(false); };
+    window.addEventListener('keydown', keyDown);
+    window.addEventListener('keyup', keyUp);
+    return () => {
+      window.removeEventListener('keydown', keyDown);
+      window.removeEventListener('keyup', keyUp);
+    };
+  }, [activeTool, clearSelection, dispatch, duplicateSelection, gridSize, plan, selectedIds, setActiveTool, setSelectedIds]);
+
+  useEffect(() => {
+    const transformer = transformerRef.current;
+    const stage = stageRef.current;
+    if (!transformer || !stage) return;
+    if (selectedIds.size === 1) {
+      const id = [...selectedIds][0];
+      const obstacle = plan.obstacles.find((o) => o.id === id);
+      const node = obstacle ? stage.findOne(`#${id}`) : null;
+      transformer.nodes(node ? [node] : []);
+    } else {
+      transformer.nodes([]);
+    }
+    transformer.getLayer()?.batchDraw();
+  }, [plan.obstacles, selectedIds]);
+
+  const fitPlan = useCallback(() => {
+    const stage = stageRef.current;
+    if (!stage || !size.width || !size.height) return;
+    const padX = 70;
+    const padY = 80;
+    const nextScale = Math.max(.2, Math.min(2, Math.min((size.width - padX * 2) / plan.width, (size.height - padY * 2) / plan.height)));
+    setScale(nextScale);
+    stage.position({
+      x: (size.width - plan.width * nextScale) / 2,
+      y: (size.height - plan.height * nextScale) / 2,
+    });
+    stage.batchDraw();
+  }, [plan.height, plan.width, setScale, size.height, size.width]);
+
+  const focusSelection = useCallback(() => {
+    const stage = stageRef.current;
+    if (!stage || !selectedIds.size) return;
+    const boxes = [...selectedIds].map(entityBounds).filter((x): x is Box => !!x);
+    if (!boxes.length) return;
+    const minX = Math.min(...boxes.map((x) => x.x));
+    const minY = Math.min(...boxes.map((x) => x.y));
+    const maxX = Math.max(...boxes.map((x) => x.x + x.width));
+    const maxY = Math.max(...boxes.map((x) => x.y + x.height));
+    stage.position({
+      x: size.width / 2 - ((minX + maxX) / 2) * scale,
+      y: size.height / 2 - ((minY + maxY) / 2) * scale,
+    });
+    stage.batchDraw();
+  }, [entityBounds, scale, selectedIds, size.height, size.width]);
+
+  useEffect(() => {
+    if (!size.width || !size.height || lastFitPlanId.current === plan.id) return;
+    lastFitPlanId.current = plan.id;
+    requestAnimationFrame(fitPlan);
+  }, [fitPlan, plan.id, size.height, size.width]);
+
+  const zoomAround = useCallback((nextScale: number, pointer?: Point) => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const oldScale = stage.scaleX();
+    const clamped = Math.max(.2, Math.min(3, nextScale));
+    const screenPoint = pointer ?? { x: size.width / 2, y: size.height / 2 };
+    const world = { x: (screenPoint.x - stage.x()) / oldScale, y: (screenPoint.y - stage.y()) / oldScale };
+    setScale(clamped);
+    stage.position({ x: screenPoint.x - world.x * clamped, y: screenPoint.y - world.y * clamped });
+    stage.batchDraw();
+  }, [setScale, size.height, size.width]);
 
   const handleWheel = (e: Konva.KonvaEventObject<WheelEvent>) => {
     e.evt.preventDefault();
     const stage = e.target.getStage();
     if (!stage) return;
-
-    const scaleBy = 1.1;
-    const oldScale = stage.scaleX();
-
     const pointer = stage.getPointerPosition();
     if (!pointer) return;
-
-    const mousePointTo = {
-        x: (pointer.x - stage.x()) / oldScale,
-        y: (pointer.y - stage.y()) / oldScale,
-    };
-
-    const newScale = e.evt.deltaY < 0 ? oldScale * scaleBy : oldScale / scaleBy;
-
-    if (newScale < 0.1 || newScale > 10) return;
-
-    setScale(newScale);
-
-    const newPos = {
-        x: pointer.x - mousePointTo.x * newScale,
-        y: pointer.y - mousePointTo.y * newScale,
-    };
-    stage.position(newPos);
+    const factor = e.evt.deltaY < 0 ? 1.08 : 1 / 1.08;
+    zoomAround(stage.scaleX() * factor, pointer);
   };
 
   const handleMouseDown = (e: Konva.KonvaEventObject<MouseEvent>) => {
     const stage = e.target.getStage();
-    if (!stage) return;
-
-    // If clicking on empty stage, deselect (unless holding shift for multiselect, to be added)
-    const clickedOnEmpty = e.target === stage || e.target.hasName('bg');
-
+    if (!stage || isSpacePressed) return;
     const pos = getStagePointerPosition(stage);
     if (!pos) return;
+    const clickedOnEmpty = e.target === stage || e.target.hasName('bg');
 
-    if (activeTool === 'select' && clickedOnEmpty) {
-        // Start selection box
-        if (!e.evt.shiftKey) {
-            clearSelection();
-        }
-        setSelectionBox({
-            x: pos.x,
-            y: pos.y,
-            width: 0,
-            height: 0
-        });
-        return; // Don't process other tools
+    if (activeTool === 'select') {
+      if (!clickedOnEmpty) return;
+      const additive = e.evt.shiftKey || e.evt.ctrlKey || e.evt.metaKey;
+      if (!additive) clearSelection();
+      setSelectionAdditive(additive);
+      setSelectionBox({ x: pos.x, y: pos.y, width: 0, height: 0 });
+      return;
     }
 
-    if (clickedOnEmpty && activeTool !== 'select') {
-        clearSelection();
-    }
+    if (clickedOnEmpty) clearSelection();
 
     if (activeTool === 'router') {
-        const snapedPos = { x: snapToGrid(pos.x), y: snapToGrid(pos.y) };
-        dispatch({
-            type: 'ADD_ROUTER',
-            payload: {
-                id: uuidv4(),
-                x: snapedPos.x,
-                y: snapedPos.y,
-                txPower: 20,
-                band: 5,
-                gain: 2,
-                ssid: `AP-${plan.routers.length + 1}`,
-                mode: RouterMode.Solo,
-                meshParentId: null,
-                backhaulType: BackhaulType.Wireless,
-                backhaulBand: 5
-            }
-        });
-        return;
+      const id = uuidv4();
+      const p = { x: snapToGrid(pos.x), y: snapToGrid(pos.y) };
+      dispatch({
+        type: 'ADD_ROUTER',
+        payload: {
+          id, x: p.x, y: p.y, txPower: 20, band: 5, gain: 2,
+          ssid: `AP-${plan.routers.length + 1}`, mode: RouterMode.Solo,
+          meshParentId: null, backhaulType: BackhaulType.Wireless, backhaulBand: 5,
+        },
+      });
+      setSelectedIds(new Set([id]));
+      setActiveTool('select');
+      return;
     }
 
     if (activeTool === 'door') {
-        if (hoveredWallId && doorPreviewPos) {
-            const wall = plan.walls.find(w => w.id === hoveredWallId);
-            if (wall) {
-                const dist = distance(wall.p1, doorPreviewPos);
-                dispatch({
-                    type: 'ADD_DOOR',
-                    payload: {
-                        id: uuidv4(),
-                        wallId: hoveredWallId,
-                        distance: dist,
-                        width: 80,
-                        type: DoorType.Wood
-                    }
-                });
-            }
-        }
-        return;
+      if (!hoveredWallId || !doorPreviewPos) return;
+      const wall = plan.walls.find((w) => w.id === hoveredWallId);
+      if (!wall) return;
+      const id = uuidv4();
+      dispatch({ type: 'ADD_DOOR', payload: { id, wallId: wall.id, distance: distance(wall.p1, doorPreviewPos), width: 80, type: DoorType.Wood } });
+      setSelectedIds(new Set([id]));
+      setActiveTool('select');
+      setHoveredWallId(null);
+      setDoorPreviewPos(null);
+      return;
     }
 
-    if (activeTool !== 'wall' && activeTool !== 'obstacle') return;
-
-    const snapedPos = activeTool === 'wall' ? snapToWallEndpoint(pos) : { x: snapToGrid(pos.x), y: snapToGrid(pos.y) };
-
+    if (!['wall', 'obstacle', 'room'].includes(activeTool)) return;
+    const snapped = activeTool === 'wall' ? snapToWallEndpoint(pos) : { x: snapToGrid(pos.x), y: snapToGrid(pos.y) };
     setIsDrawing(true);
-    setStartPoint(snapedPos);
-    setCurrentPoint(snapedPos);
+    setStartPoint(snapped);
+    setCurrentPoint(snapped);
   };
 
   const handleMouseMove = (e: Konva.KonvaEventObject<MouseEvent>) => {
@@ -248,153 +527,122 @@ export const EditorCanvas: React.FC<EditorCanvasProps> = ({ simulationResult }) 
     const pos = getStagePointerPosition(stage);
     if (!pos) return;
 
-    // Selection Box Logic
+    const dragSession = dragSessionRef.current;
+    if (dragSession) {
+      const dx = pos.x - dragSession.start.x;
+      const dy = pos.y - dragSession.start.y;
+      if (!dragSession.moved && Math.hypot(dx, dy) >= 3 / Math.max(scale, .25)) dragSession.moved = true;
+      if (dragSession.moved) setDragDelta({ x: dx, y: dy });
+      return;
+    }
+
     if (selectionBox) {
-        setSelectionBox({
-            ...selectionBox,
-            width: pos.x - selectionBox.x,
-            height: pos.y - selectionBox.y
-        });
-        return;
+      setSelectionBox({ ...selectionBox, width: pos.x - selectionBox.x, height: pos.y - selectionBox.y });
+      return;
     }
-
-    // Tooltip logic
-    if (simulationResult && !isDrawing) {
-        const gx = Math.floor(pos.x / simulationResult.resolution);
-        const gy = Math.floor(pos.y / simulationResult.resolution);
-        if (gx >= 0 && gx < simulationResult.width && gy >= 0 && gy < simulationResult.height) {
-            const index = gy * simulationResult.width + gx;
-            const rssi = simulationResult.data[index];
-            if (rssi > -120) {
-                 setTooltip({
-                     x: pos.x + 10,
-                     y: pos.y + 10,
-                     text: `${rssi.toFixed(1)} dBm`
-                 });
-            } else {
-                setTooltip(null);
-            }
-        } else {
-             setTooltip(null);
-        }
-    } else {
-        setTooltip(null);
-    }
-
 
     if (activeTool === 'door') {
-        let closestDist = Infinity;
-        let closestWallId = null;
-        let closestPoint = null;
-
-        plan.walls.forEach(wall => {
-            const nearest = getNearestPointOnSegment(wall.p1, wall.p2, pos);
-            const dist = distance(nearest, pos);
-            if (dist < 20) {
-                if (dist < closestDist) {
-                    closestDist = dist;
-                    closestWallId = wall.id;
-                    closestPoint = nearest;
-                }
-            }
-        });
-
-        if (closestWallId && closestPoint) {
-            setHoveredWallId(closestWallId);
-            setDoorPreviewPos(closestPoint);
-        } else {
-            setHoveredWallId(null);
-            setDoorPreviewPos(null);
+      let closestDistance = Infinity;
+      let closestWall: string | null = null;
+      let closestPoint: Point | null = null;
+      plan.walls.forEach((wall) => {
+        const nearest = getNearestPointOnSegment(wall.p1, wall.p2, pos);
+        const d = distance(nearest, pos);
+        const threshold = 18 / Math.max(scale, .25);
+        if (d < threshold && d < closestDistance) {
+          closestDistance = d;
+          closestWall = wall.id;
+          closestPoint = nearest;
         }
+      });
+      setHoveredWallId(closestWall);
+      setDoorPreviewPos(closestPoint);
     }
 
-    if (!isDrawing) return;
+    if (simulationResult && !isDrawing && activeTool === 'select') {
+      const gx = Math.floor(pos.x / simulationResult.resolution);
+      const gy = Math.floor(pos.y / simulationResult.resolution);
+      if (gx >= 0 && gx < simulationResult.width && gy >= 0 && gy < simulationResult.height) {
+        const rssi = simulationResult.data[gy * simulationResult.width + gx];
+        setTooltip(rssi > -120 ? { x: pos.x + 12 / scale, y: pos.y + 12 / scale, text: `${rssi.toFixed(0)} dBm` } : null);
+      } else setTooltip(null);
+    } else setTooltip(null);
 
-    const snapedPos = activeTool === 'wall' ? snapToWallEndpoint(pos) : { x: snapToGrid(pos.x), y: snapToGrid(pos.y) };
-    setCurrentPoint(snapedPos);
+    if (!isDrawing) return;
+    const snapped = activeTool === 'wall' ? snapToWallEndpoint(pos) : { x: snapToGrid(pos.x), y: snapToGrid(pos.y) };
+    setCurrentPoint(snapped);
   };
 
   const handleMouseUp = () => {
-    // Selection Box End
+    const dragSession = dragSessionRef.current;
+    if (dragSession) {
+      if (dragSession.moved) {
+        const snapped = snapDragDelta(dragSession, dragDelta);
+        dispatch({ type: 'TRANSLATE_ENTITIES', payload: { ids: [...dragSession.ids], dx: snapped.x, dy: snapped.y } });
+      }
+      dragSessionRef.current = null;
+      setDragDelta({ x: 0, y: 0 });
+      return;
+    }
+
     if (selectionBox) {
-        // Calculate bounding box normalized
-        const x1 = Math.min(selectionBox.x, selectionBox.x + selectionBox.width);
-        const x2 = Math.max(selectionBox.x, selectionBox.x + selectionBox.width);
-        const y1 = Math.min(selectionBox.y, selectionBox.y + selectionBox.height);
-        const y2 = Math.max(selectionBox.y, selectionBox.y + selectionBox.height);
-
-        const newSelected = new Set(selectedIds);
-
-        // Find intersecting objects
-        // Walls
-        plan.walls.forEach(w => {
-            // Simple AABB check for segments is tricky, check if endpoints inside
-            if ((w.p1.x >= x1 && w.p1.x <= x2 && w.p1.y >= y1 && w.p1.y <= y2) ||
-                (w.p2.x >= x1 && w.p2.x <= x2 && w.p2.y >= y1 && w.p2.y <= y2)) {
-                newSelected.add(w.id);
-            }
+      const box = normalizeBox(selectionBox);
+      const next = selectionAdditive ? new Set(selectedIds) : new Set<string>();
+      if (box.width > 2 || box.height > 2) {
+        allEntityIds(plan).forEach((id) => {
+          const bounds = entityBounds(id);
+          if (bounds && boxesIntersect(box, bounds)) next.add(id);
         });
-        // Obstacles
-        plan.obstacles.forEach(o => {
-            if (o.x >= x1 && o.x <= x2 && o.y >= y1 && o.y <= y2) { // Center point check, or corner check? AABB check better.
-                // Assuming o.x, o.y is top-left
-                if (o.x + o.width >= x1 && o.x <= x2 && o.y + o.height >= y1 && o.y <= y2) {
-                    newSelected.add(o.id);
-                }
-            }
-        });
-        // Routers
-        plan.routers.forEach(r => {
-            if (r.x >= x1 && r.x <= x2 && r.y >= y1 && r.y <= y2) {
-                newSelected.add(r.id);
-            }
-        });
-
-        setSelectedIds(newSelected);
-        setSelectionBox(null);
-        return;
+      }
+      setSelectedIds(next);
+      setSelectionBox(null);
+      return;
     }
 
     if (!isDrawing || !startPoint || !currentPoint) return;
 
-    if (activeTool === 'wall') {
-        if (startPoint.x !== currentPoint.x || startPoint.y !== currentPoint.y) {
-          dispatch({
-            type: 'ADD_WALL',
-            payload: {
-              id: uuidv4(),
-              p1: startPoint,
-              p2: currentPoint,
-              thickness: 15,
-              material: WallMaterial.Drywall,
-            },
-          });
-        }
-    } else if (activeTool === 'obstacle') {
-        let width = currentPoint.x - startPoint.x;
-        let height = currentPoint.y - startPoint.y;
+    if (activeTool === 'wall' && (startPoint.x !== currentPoint.x || startPoint.y !== currentPoint.y)) {
+      const id = uuidv4();
+      dispatch({ type: 'ADD_WALL', payload: { id, p1: startPoint, p2: currentPoint, thickness: 15, material: WallMaterial.Drywall } });
+      setSelectedIds(new Set([id]));
+    }
 
-        // Default size if simple click
-        if (Math.abs(width) < 5 && Math.abs(height) < 5) {
-            width = 100;
-            height = 100;
-        }
+    if (activeTool === 'room') {
+      const x1 = Math.min(startPoint.x, currentPoint.x);
+      const y1 = Math.min(startPoint.y, currentPoint.y);
+      const x2 = Math.max(startPoint.x, currentPoint.x);
+      const y2 = Math.max(startPoint.y, currentPoint.y);
+      if (x2 - x1 >= gridSize && y2 - y1 >= gridSize) {
+        const walls: Wall[] = [
+          { id: uuidv4(), p1: { x: x1, y: y1 }, p2: { x: x2, y: y1 }, thickness: 15, material: WallMaterial.Drywall },
+          { id: uuidv4(), p1: { x: x2, y: y1 }, p2: { x: x2, y: y2 }, thickness: 15, material: WallMaterial.Drywall },
+          { id: uuidv4(), p1: { x: x2, y: y2 }, p2: { x: x1, y: y2 }, thickness: 15, material: WallMaterial.Drywall },
+          { id: uuidv4(), p1: { x: x1, y: y2 }, p2: { x: x1, y: y1 }, thickness: 15, material: WallMaterial.Drywall },
+        ];
+        dispatch({ type: 'ADD_WALLS', payload: walls });
+        setSelectedIds(new Set(walls.map((w) => w.id)));
+        setActiveTool('select');
+      }
+    }
 
-        if (width !== 0 && height !== 0) {
-            dispatch({
-                type: 'ADD_OBSTACLE',
-                payload: {
-                    id: uuidv4(),
-                    x: Math.min(startPoint.x, currentPoint.x),
-                    y: Math.min(startPoint.y, currentPoint.y),
-                    width: Math.abs(width),
-                    height: Math.abs(height),
-                    rotation: 0,
-                    type: ObstacleType.Generic,
-                    label: 'Obstacle'
-                }
-            })
-        }
+    if (activeTool === 'obstacle') {
+      let width = currentPoint.x - startPoint.x;
+      let height = currentPoint.y - startPoint.y;
+      if (Math.abs(width) < 5 && Math.abs(height) < 5) { width = 100; height = 100; }
+      if (width && height) {
+        const id = uuidv4();
+        dispatch({
+          type: 'ADD_OBSTACLE',
+          payload: {
+            id,
+            x: Math.min(startPoint.x, currentPoint.x), y: Math.min(startPoint.y, currentPoint.y),
+            width: Math.abs(width), height: Math.abs(height), rotation: 0,
+            type: ObstacleType.Generic, label: 'Object',
+          },
+        });
+        setSelectedIds(new Set([id]));
+        setActiveTool('select');
+      }
     }
 
     setIsDrawing(false);
@@ -402,695 +650,244 @@ export const EditorCanvas: React.FC<EditorCanvasProps> = ({ simulationResult }) 
     setCurrentPoint(null);
   };
 
-  // Identify unique endpoints for Wall Joints
-  const uniqueEndpoints = useMemo(() => {
-      const points: Point[] = [];
-      const keys = new Set<string>();
-
-      plan.walls.forEach(w => {
-          [w.p1, w.p2].forEach(p => {
-              const key = `${p.x},${p.y}`;
-              if (!keys.has(key)) {
-                  keys.add(key);
-                  points.push(p);
-              }
-          });
-      });
-      return points;
-  }, [plan.walls]);
+  const selectedSingleWall = useMemo(() => {
+    if (selectedIds.size !== 1 || activeTool !== 'select') return null;
+    const id = [...selectedIds][0];
+    return plan.walls.find((w) => w.id === id) ?? null;
+  }, [activeTool, plan.walls, selectedIds]);
 
   const handleJointDragMove = (e: Konva.KonvaEventObject<DragEvent>, originalPoint: Point) => {
-      // In Konva, dragging updates the x/y properties to the absolute position relative to parent.
-      // Since the Circle is a direct child of Layer, x() and y() are the world coordinates.
-      // We don't add originalPoint because the node has already moved there.
-
-      const newX = snapToGrid(e.target.x());
-      const newY = snapToGrid(e.target.y());
-
-      // Update visual lines directly
-      const layer = layerRef.current;
-      if (layer) {
-          plan.walls.forEach(w => {
-              let p1 = w.p1;
-              let p2 = w.p2;
-              let update = false;
-
-              if (w.p1.x === originalPoint.x && w.p1.y === originalPoint.y) {
-                  p1 = { x: newX, y: newY };
-                  update = true;
-              }
-              if (w.p2.x === originalPoint.x && w.p2.y === originalPoint.y) {
-                  p2 = { x: newX, y: newY };
-                  update = true;
-              }
-
-              if (update) {
-                  const line = layer.findOne('#' + w.id) as Konva.Line;
-                  if (line) {
-                      line.points([p1.x, p1.y, p2.x, p2.y]);
-                  }
-              }
-          });
+    const x = snapToGrid(e.target.x());
+    const y = snapToGrid(e.target.y());
+    const layer = layerRef.current;
+    if (!layer) return;
+    plan.walls.forEach((w) => {
+      let p1 = w.p1;
+      let p2 = w.p2;
+      let changed = false;
+      if (pointKey(w.p1) === pointKey(originalPoint)) { p1 = { x, y }; changed = true; }
+      if (pointKey(w.p2) === pointKey(originalPoint)) { p2 = { x, y }; changed = true; }
+      if (changed) {
+        const line = layer.findOne(`#${w.id}`) as Konva.Line | undefined;
+        line?.points([p1.x, p1.y, p2.x, p2.y]);
       }
+    });
   };
 
   const handleJointDragEnd = (e: Konva.KonvaEventObject<DragEvent>, originalPoint: Point) => {
-      // Get final position
-      const newX = snapToGrid(e.target.x());
-      const newY = snapToGrid(e.target.y());
-
-      // We don't manually reset x/y to 0 here.
-      // When we dispatch the update, React will re-render the Circle with new x={newX} y={newY}.
-      // React-Konva will update the node's position to match the prop.
-      // Since e.target.x() is already newX (approx), it stays put.
-
-      // Find all walls connected to originalPoint and update them
-      plan.walls.forEach(w => {
-          let updated = false;
-          let newP1 = w.p1;
-          let newP2 = w.p2;
-
-          if (w.p1.x === originalPoint.x && w.p1.y === originalPoint.y) {
-              newP1 = { x: newX, y: newY };
-              updated = true;
-          }
-          if (w.p2.x === originalPoint.x && w.p2.y === originalPoint.y) {
-              newP2 = { x: newX, y: newY };
-              updated = true;
-          }
-
-          if (updated) {
-              dispatch({
-                  type: 'UPDATE_WALL',
-                  payload: { ...w, p1: newP1, p2: newP2 }
-              });
-          }
-      });
+    const x = snapToGrid(e.target.x());
+    const y = snapToGrid(e.target.y());
+    const updates = plan.walls.flatMap((w) => {
+      const p1 = pointKey(w.p1) === pointKey(originalPoint) ? { x, y } : w.p1;
+      const p2 = pointKey(w.p2) === pointKey(originalPoint) ? { x, y } : w.p2;
+      return p1 !== w.p1 || p2 !== w.p2 ? [{ ...w, p1, p2 }] : [];
+    });
+    if (updates.length) dispatch({ type: 'UPDATE_WALLS', payload: updates });
   };
 
-  // Generate grid lines
-  const gridLines = [];
-  const width = Math.max(size.width, plan.width);
-  const height = Math.max(size.height, plan.height);
-
-  for (let i = 0; i <= width; i += gridSize) {
-    gridLines.push(
-        <Line
-          key={`v${i}`}
-          points={[i, 0, i, height]}
-          stroke="#ddd"
-          strokeWidth={1}
-          listening={false}
-        />
-    );
-  }
-  for (let j = 0; j <= height; j += gridSize) {
-    gridLines.push(
-        <Line
-          key={`h${j}`}
-          points={[0, j, width, j]}
-          stroke="#ddd"
-          strokeWidth={1}
-          listening={false}
-        />
-    );
-  }
+  const gridLines = useMemo(() => {
+    if (!showGrid) return [];
+    const lines: React.ReactNode[] = [];
+    for (let x = 0; x <= plan.width; x += gridSize) {
+      const major = x % (gridSize * 4) === 0;
+      lines.push(<Line key={`v${x}`} points={[x, 0, x, plan.height]} stroke={major ? '#d8dee7' : '#e9edf2'} strokeWidth={major ? 1.2 : .7} listening={false} />);
+    }
+    for (let y = 0; y <= plan.height; y += gridSize) {
+      const major = y % (gridSize * 4) === 0;
+      lines.push(<Line key={`h${y}`} points={[0, y, plan.width, y]} stroke={major ? '#d8dee7' : '#e9edf2'} strokeWidth={major ? 1.2 : .7} listening={false} />);
+    }
+    return lines;
+  }, [gridSize, plan.height, plan.width, showGrid]);
 
   return (
     <div className="canvas-container" ref={containerRef}>
+      <div className="canvas-help">
+        <strong>{activeTool === 'select' ? (selectedIds.size > 1 ? `${selectedIds.size} items selected` : 'Select and edit') : activeTool === 'room' ? 'Drag a room' : activeTool === 'wall' ? 'Drag a wall segment' : activeTool === 'door' ? 'Hover a wall and click' : activeTool === 'router' ? 'Place an access point' : 'Drag an object'}</strong>
+        <span>{activeTool === 'select' ? 'Drag selected items together · Shift-click adds/removes · Drag empty space for marquee' : 'Esc returns to Select · Scroll zooms · Hold Space to pan'}</span>
+      </div>
+
+      <div className="canvas-zoom-controls" aria-label="Canvas view controls">
+        <button type="button" onClick={() => zoomAround(scale / 1.15)} title="Zoom out"><Minus size={15} /></button>
+        <span>{Math.round(scale * 100)}%</span>
+        <button type="button" onClick={() => zoomAround(scale * 1.15)} title="Zoom in"><Plus size={15} /></button>
+        <i />
+        <button type="button" onClick={fitPlan} title="Fit floor plan"><Maximize2 size={15} /></button>
+        <button type="button" onClick={focusSelection} disabled={!selectedIds.size} title="Focus selection"><Crosshair size={15} /></button>
+      </div>
+
+      {simulationResult && showHeatmap ? <div className="heatmap-legend"><span>Signal</span><i className="legend-gradient" /><small>Weak</small><small>Strong</small></div> : null}
+
       <Stage
+        ref={stageRef}
         width={size.width}
         height={size.height}
-        draggable={activeTool === 'select' || activeTool === 'obstacle' || activeTool === 'router'}
+        draggable={isSpacePressed}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onWheel={handleWheel}
         scaleX={scale}
         scaleY={scale}
-        style={{ cursor: activeTool === 'select' ? 'grab' : 'crosshair' }}
+        style={{ cursor: isSpacePressed ? 'grab' : activeTool === 'select' ? 'default' : 'crosshair' }}
       >
         <Layer>
-            <Rect
-                name="bg"
-                width={plan.width}
-                height={plan.height}
-                fill="#fff"
-                onClick={() => setSelectedIds(new Set())}
-            />
-            {gridLines}
+          <Rect name="bg" width={plan.width} height={plan.height} fill="#fff" stroke="#d9dee6" strokeWidth={1} />
+          {gridLines}
         </Layer>
 
         <Layer>
-            {simulationResult && (
-                <Heatmap data={simulationResult} />
-            )}
+          {simulationResult && showHeatmap ? <Heatmap data={simulationResult} opacity={heatmapOpacity} /> : null}
         </Layer>
 
         <Layer ref={layerRef}>
-          {plan.walls.map((wall) => (
-            <React.Fragment key={wall.id}>
-                 <Line
-                    id={wall.id}
-                    points={[wall.p1.x, wall.p1.y, wall.p2.x, wall.p2.y]}
-                    stroke={selectedIds.has(wall.id) ? '#00f' : '#333'}
-                    strokeWidth={wall.thickness}
-                    lineCap="square"
-                    onClick={(e) => {
-                        if (activeTool === 'select') {
-                            e.cancelBubble = true;
-                            if (e.evt.shiftKey) {
-                                toggleSelection(wall.id);
-                            } else {
-                                setSelectedIds(new Set([wall.id]));
-                            }
-                        }
-                    }}
-                    draggable={activeTool === 'select'}
-                    onDragMove={(e) => {
-                        // Edge dragging logic - move connected endpoints visually
-                        const dx = e.target.x();
-                        const dy = e.target.y();
-                        const p1 = { x: wall.p1.x + dx, y: wall.p1.y + dy };
-                        const p2 = { x: wall.p2.x + dx, y: wall.p2.y + dy };
+          {plan.walls.map((original) => {
+            const wall = previewWall(original);
+            const selected = selectedIds.has(original.id);
+            return <Line
+              key={original.id}
+              id={original.id}
+              points={[wall.p1.x, wall.p1.y, wall.p2.x, wall.p2.y]}
+              stroke={selected ? '#2563eb' : '#344054'}
+              strokeWidth={original.thickness}
+              hitStrokeWidth={Math.max(18, original.thickness + 8)}
+              lineCap="square"
+              onMouseDown={(e) => beginEntityPointer(original.id, e)}
+              onMouseEnter={(e) => { if (activeTool === 'select') e.target.getStage()!.container().style.cursor = selected ? 'move' : 'pointer'; }}
+              onMouseLeave={(e) => { if (activeTool === 'select') e.target.getStage()!.container().style.cursor = 'default'; }}
+            />;
+          })}
 
-                        // We need to move visuals of OTHER lines connected to p1 or p2
-                        // This is tricky because we don't have easy access to them without iterating
-                        // For smooth rubber banding of edges, we need to find neighbors.
-
-                        const layer = layerRef.current;
-                        if (layer) {
-                            plan.walls.forEach(other => {
-                                if (other.id === wall.id) return;
-                                let op1 = other.p1;
-                                let op2 = other.p2;
-                                let update = false;
-
-                                if (other.p1.x === wall.p1.x && other.p1.y === wall.p1.y) {
-                                    op1 = p1; update = true;
-                                } else if (other.p1.x === wall.p2.x && other.p1.y === wall.p2.y) {
-                                    op1 = p2; update = true;
-                                }
-
-                                if (other.p2.x === wall.p1.x && other.p2.y === wall.p1.y) {
-                                    op2 = p1; update = true;
-                                } else if (other.p2.x === wall.p2.x && other.p2.y === wall.p2.y) {
-                                    op2 = p2; update = true;
-                                }
-
-                                if (update) {
-                                    const line = layer.findOne('#' + other.id) as Konva.Line;
-                                    if (line) {
-                                        line.points([op1.x, op1.y, op2.x, op2.y]);
-                                    }
-                                }
-                            });
-
-                            // Also update Joints (Circles) visually
-                            const joints = layer.find('Circle');
-                            joints.forEach(shape => {
-                                if (shape.name() === 'joint') {
-                                    // joints are not identified by ID, but by position.
-                                    // This part is hard because joints are rendered based on state.
-                                    // If we move the line, the state hasn't changed, so joints stay put.
-                                    // We need to move the joints that match wall.p1 and wall.p2
-                                    const jx = shape.attrs.x;
-                                    const jy = shape.attrs.y;
-
-                                    if (jx === wall.p1.x && jy === wall.p1.y) {
-                                        shape.position({x: p1.x, y: p1.y});
-                                    } else if (jx === wall.p2.x && jy === wall.p2.y) {
-                                        shape.position({x: p2.x, y: p2.y});
-                                    }
-                                }
-                            });
-                        }
-                    }}
-                    onDragEnd={(e) => {
-                         const dx = e.target.x();
-                         const dy = e.target.y();
-                         e.target.x(0);
-                         e.target.y(0);
-
-                         const newP1 = { x: snapToGrid(wall.p1.x + dx), y: snapToGrid(wall.p1.y + dy) };
-                         const newP2 = { x: snapToGrid(wall.p2.x + dx), y: snapToGrid(wall.p2.y + dy) };
-
-                         // We need to update this wall AND connected walls
-                         // Dispatching multiple actions? Or a batch update?
-                         // Current reducer handles one action.
-                         // But we can dispatch individually.
-
-                         // Better: Find all affected walls and update them.
-
-                         // List of actions to dispatch
-                         const updates = [];
-
-                         // Update dragged wall
-                         updates.push({
-                             type: 'UPDATE_WALL',
-                             payload: { ...wall, p1: newP1, p2: newP2 }
-                         });
-
-                         // Update neighbors
-                         plan.walls.forEach(other => {
-                             if (other.id === wall.id) return;
-                             let op1 = other.p1;
-                             let op2 = other.p2;
-                             let update = false;
-
-                             if (other.p1.x === wall.p1.x && other.p1.y === wall.p1.y) {
-                                 op1 = newP1; update = true;
-                             } else if (other.p1.x === wall.p2.x && other.p1.y === wall.p2.y) {
-                                 op1 = newP2; update = true;
-                             }
-
-                             if (other.p2.x === wall.p1.x && other.p2.y === wall.p1.y) {
-                                 op2 = newP1; update = true;
-                             } else if (other.p2.x === wall.p2.x && other.p2.y === wall.p2.y) {
-                                 op2 = newP2; update = true;
-                             }
-
-                             if (update) {
-                                 updates.push({
-                                     type: 'UPDATE_WALL',
-                                     payload: { ...other, p1: op1, p2: op2 }
-                                 });
-                             }
-                         });
-
-                         // Dispatch all
-                         // Ideally we should have a BATCH_ACTION or handle it in reducer
-                         // For now, looping dispatch is fine, but history will have multiple entries?
-                         // History reducer wraps the dispatch.
-                         // If we call dispatch multiple times, we get multiple history steps.
-                         // We need a transaction or batch.
-                         // Let's rely on individual dispatches for now or add a BATCH_UPDATE_WALLS action.
-                         // Adding BATCH_UPDATE_WALLS is cleaner.
-
-                         // But I can't easily change reducer signature without breaking things.
-                         // Let's execute them.
-                         updates.forEach(u => dispatch(u));
-                    }}
-                  />
-            </React.Fragment>
-          ))}
-
-          {/* Wall Joints (Handles) */}
-          {activeTool === 'select' && uniqueEndpoints.map((p) => (
-              <Circle
-                key={`joint-${p.x}-${p.y}`}
-                name="joint"
-                x={p.x}
-                y={p.y}
-                radius={6}
-                fill="#fff"
-                stroke="#00f"
-                strokeWidth={2}
-                draggable
-                onDragMove={(e) => handleJointDragMove(e, p)}
-                onDragEnd={(e) => handleJointDragEnd(e, p)}
-                onMouseEnter={(e) => {
-                    const container = e.target.getStage()?.container();
-                    if (container) container.style.cursor = 'move';
-                }}
-                onMouseLeave={(e) => {
-                    const container = e.target.getStage()?.container();
-                    if (container) container.style.cursor = 'default';
-                }}
-              />
-          ))}
+          {selectedSingleWall ? [selectedSingleWall.p1, selectedSingleWall.p2].map((p, index) => (
+            <Circle
+              key={`${selectedSingleWall.id}-joint-${index}`}
+              x={p.x} y={p.y} radius={7 / Math.max(scale, .55)}
+              fill="#fff" stroke="#2563eb" strokeWidth={2 / Math.max(scale, .55)}
+              draggable
+              onMouseDown={(e) => { e.cancelBubble = true; }}
+              onDragMove={(e) => handleJointDragMove(e, p)}
+              onDragEnd={(e) => handleJointDragEnd(e, p)}
+              onMouseEnter={(e) => { e.target.getStage()!.container().style.cursor = 'move'; }}
+              onMouseLeave={(e) => { e.target.getStage()!.container().style.cursor = 'default'; }}
+            />
+          )) : null}
 
           {plan.doors.map((door) => {
-              const wall = plan.walls.find(w => w.id === door.wallId);
-              if (!wall) return null;
-
-              const len = distance(wall.p1, wall.p2);
-              if (len === 0) return null;
-
-              const dx = (wall.p2.x - wall.p1.x) / len;
-              const dy = (wall.p2.y - wall.p1.y) / len;
-
-              const x = wall.p1.x + dx * door.distance;
-              const y = wall.p1.y + dy * door.distance;
-
-              const angle = Math.atan2(dy, dx) * 180 / Math.PI;
-
-              return (
-                  <Group
-                    key={door.id}
-                    x={x}
-                    y={y}
-                    rotation={angle}
-                    draggable={activeTool === 'select'}
-                    onClick={(e) => {
-                         if (activeTool === 'select') {
-                            e.cancelBubble = true;
-                            if (e.evt.shiftKey) {
-                                toggleSelection(door.id);
-                            } else {
-                                setSelectedIds(new Set([door.id]));
-                            }
-                        }
-                    }}
+            const preview = previewDoor(door);
+            if (!preview) return null;
+            const selected = selectedIds.has(door.id);
+            return (
+              <Group key={door.id} id={door.id} x={preview.x} y={preview.y} rotation={preview.angle} onMouseDown={(e) => beginEntityPointer(door.id, e)}>
+                <Rect
+                  x={-door.width / 2} y={-preview.wall.thickness / 2 - 3}
+                  width={door.width} height={preview.wall.thickness + 6}
+                  fill="#fbbf24" stroke={selected ? '#2563eb' : '#d97706'} strokeWidth={selected ? 2.5 : 1}
+                  cornerRadius={2}
+                />
+                {selectedIds.size === 1 && selected ? <>
+                  {[-1, 1].map((side) => <Circle
+                    key={side}
+                    x={side * door.width / 2} y={0} radius={6 / Math.max(scale, .6)}
+                    fill="#fff" stroke="#2563eb" strokeWidth={2 / Math.max(scale, .6)} draggable
+                    onMouseDown={(e) => { e.cancelBubble = true; }}
+                    onDragMove={(e) => { e.cancelBubble = true; e.target.y(0); }}
                     onDragEnd={(e) => {
-                        const node = e.target;
-                        const newX = node.x();
-                        const newY = node.y();
-                        const p = { x: newX, y: newY };
-                        const nearest = getNearestPointOnSegment(wall.p1, wall.p2, p);
-                        const newDist = distance(wall.p1, nearest);
-
-                        dispatch({
-                            type: 'UPDATE_DOOR',
-                            payload: {
-                                ...door,
-                                distance: newDist
-                            }
-                        });
+                      e.cancelBubble = true;
+                      const oldX = side * door.width / 2;
+                      const change = e.target.x() - oldX;
+                      const newWidth = Math.max(30, side < 0 ? door.width - change : door.width + change);
+                      const centerShift = change / 2;
+                      const newDistance = Math.max(newWidth / 2, Math.min(distance(preview.wall.p1, preview.wall.p2) - newWidth / 2, door.distance + centerShift));
+                      dispatch({ type: 'UPDATE_DOOR', payload: { ...door, width: newWidth, distance: newDistance } });
                     }}
-                  >
-                     <Rect
-                        x={-door.width/2}
-                        y={-wall.thickness/2 - 2}
-                        width={door.width}
-                        height={wall.thickness + 4}
-                        fill="#D2691E"
-                        stroke={selectedIds.has(door.id) ? '#00f' : 'transparent'}
-                        strokeWidth={2}
-                     />
-                     {/* Door Handles for Resizing */}
-                     {selectedIds.has(door.id) && (
-                         <>
-                             {/* Left Handle */}
-                             <Circle
-                                x={-door.width/2}
-                                y={0}
-                                radius={5}
-                                fill="#00f"
-                                draggable
-                                onDragMove={(e) => {
-                                    // Constrain to wall line?
-                                    // Since parent Group is rotated, dragging along X axis is dragging along wall.
-                                    e.target.y(0); // Constrain to local Y=0
-                                }}
-                                onDragEnd={(e) => {
-                                    e.target.y(0);
-                                    // dx is change in local X relative to 0 (which was -width/2)
-                                    // new x is e.target.x()
-                                    // delta width = (-width/2) - newX
-                                    // new width = width + delta?
-                                    // Let's think: center of door shifts if we only move one side.
-                                    // But door model is center-based (implied by rendering)?
-                                    // Actually door model is: distance (center or start?), width.
-                                    // Render: x = wall.p1 + dx * distance.
-                                    // Render: Rect x = -door.width/2. So 'distance' is the CENTER of the door.
-
-                                    const newLocalX = e.target.x();
-                                    const oldLocalX = -door.width/2;
-                                    const change = newLocalX - oldLocalX;
-
-                                    // If we move left handle to right (positive change), width decreases, center moves right.
-                                    // If we move left handle to left (negative change), width increases, center moves left.
-                                    // Change in width = -change (if right edge fixed)
-                                    // Change in center = change / 2
-
-                                    const newWidth = door.width - change;
-                                    const newDist = door.distance + change / 2; // In px? Yes distance is px.
-
-                                    if (newWidth > 10) {
-                                        dispatch({
-                                            type: 'UPDATE_DOOR',
-                                            payload: {
-                                                ...door,
-                                                distance: newDist,
-                                                width: newWidth
-                                            }
-                                        });
-                                    } else {
-                                        // Revert visual
-                                        e.target.x(-door.width/2);
-                                    }
-                                }}
-                             />
-                             {/* Right Handle */}
-                             <Circle
-                                x={door.width/2}
-                                y={0}
-                                radius={5}
-                                fill="#00f"
-                                draggable
-                                onDragMove={(e) => {
-                                    e.target.y(0);
-                                }}
-                                onDragEnd={(e) => {
-                                    e.target.y(0);
-                                    const newLocalX = e.target.x();
-                                    const oldLocalX = door.width/2;
-                                    const change = newLocalX - oldLocalX;
-
-                                    // Right handle moves right: width increases, center moves right.
-                                    const newWidth = door.width + change;
-                                    const newDist = door.distance + change / 2;
-
-                                    if (newWidth > 10) {
-                                        dispatch({
-                                            type: 'UPDATE_DOOR',
-                                            payload: {
-                                                ...door,
-                                                distance: newDist,
-                                                width: newWidth
-                                            }
-                                        });
-                                    } else {
-                                        e.target.x(door.width/2);
-                                    }
-                                }}
-                             />
-                         </>
-                     )}
-                  </Group>
-              );
+                  />)}
+                </> : null}
+              </Group>
+            );
           })}
 
-
-           {plan.obstacles.map((obs) => (
-             <Group
-                key={obs.id}
-                id={obs.id}
-                x={obs.x}
-                y={obs.y}
-                rotation={obs.rotation}
-                draggable={activeTool === 'select'}
-                onClick={(e) => {
-                    if (activeTool === 'select') {
-                        e.cancelBubble = true;
-                        if (e.evt.shiftKey) {
-                            toggleSelection(obs.id);
-                        } else {
-                            setSelectedIds(new Set([obs.id]));
-                        }
-                    }
-                }}
-                onDragEnd={(e) => {
-                    dispatch({
-                        type: 'UPDATE_OBSTACLE',
-                        payload: {
-                            ...obs,
-                            x: snapToGrid(e.target.x()),
-                            y: snapToGrid(e.target.y()),
-                        }
-                    })
-                }}
+          {plan.obstacles.map((original) => {
+            const obs = previewObstacle(original);
+            const selected = selectedIds.has(original.id);
+            return (
+              <Group
+                key={original.id} id={original.id} x={obs.x} y={obs.y} width={original.width} height={original.height} rotation={original.rotation}
+                onMouseDown={(e) => beginEntityPointer(original.id, e)}
                 onTransformEnd={(e) => {
-                    const node = e.target;
-                    const scaleX = node.scaleX();
-                    const scaleY = node.scaleY();
-                    node.scaleX(1);
-                    node.scaleY(1);
-                    dispatch({
-                        type: 'UPDATE_OBSTACLE',
-                        payload: {
-                            ...obs,
-                            x: node.x(),
-                            y: node.y(),
-                            width: Math.max(5, node.width() * scaleX),
-                            height: Math.max(5, node.height() * scaleY),
-                            rotation: node.rotation(),
-                        },
-                    });
+                  const node = e.target;
+                  const sx = node.scaleX();
+                  const sy = node.scaleY();
+                  node.scale({ x: 1, y: 1 });
+                  dispatch({
+                    type: 'UPDATE_OBSTACLE',
+                    payload: {
+                      ...original,
+                      x: snapToGrid(node.x()), y: snapToGrid(node.y()),
+                      width: Math.max(25, original.width * Math.abs(sx)),
+                      height: Math.max(25, original.height * Math.abs(sy)),
+                      rotation: Math.round(node.rotation()),
+                    },
+                  });
                 }}
-            >
-                <Rect
-                    width={obs.width}
-                    height={obs.height}
-                    fill={selectedIds.has(obs.id) ? '#aaccff' : '#cccccc'}
-                    stroke={selectedIds.has(obs.id) ? '#0055aa' : '#999999'}
-                    strokeWidth={1}
-                />
-                <Text
-                    text={obs.label}
-                    width={obs.width}
-                    height={obs.height}
-                    align="center"
-                    verticalAlign="middle"
-                    fontSize={12}
-                    fill="#000"
-                    listening={false}
-                />
-             </Group>
-          ))}
-
-          {plan.routers.map((router) => {
-              let backhaulColor = '#00aa00';
-              let parentNode = null;
-
-              if (router.mode === RouterMode.MeshNode && router.meshParentId) {
-                  parentNode = plan.routers.find(r => r.id === router.meshParentId);
-                  const rssi = calculateBackhaulRSSI(router.id, plan);
-                  backhaulColor = router.backhaulType === BackhaulType.Wired ? '#000000' : getSignalQualityColor(rssi);
-              }
-
-              return (
-              <React.Fragment key={router.id}>
-                  {parentNode && (
-                      <Line
-                        points={[parentNode.x, parentNode.y, router.x, router.y]}
-                        stroke={backhaulColor}
-                        strokeWidth={2}
-                        dash={router.backhaulType === BackhaulType.Wired ? [] : [5, 5]}
-                        listening={false}
-                      />
-                  )}
-
-                  <Group
-                    id={router.id}
-                    name="router"
-                    x={router.x}
-                    y={router.y}
-                    draggable={activeTool === 'select'}
-                    onClick={(e) => {
-                        if (activeTool === 'select') {
-                            e.cancelBubble = true;
-                            if (e.evt.shiftKey) {
-                                toggleSelection(router.id);
-                            } else {
-                                setSelectedIds(new Set([router.id]));
-                            }
-                        }
-                    }}
-                    onDragEnd={(e) => {
-                        dispatch({
-                            type: 'UPDATE_ROUTER',
-                            payload: {
-                                ...router,
-                                x: snapToGrid(e.target.x()),
-                                y: snapToGrid(e.target.y()),
-                            }
-                        })
-                    }}
-                  >
-                    <Circle
-                        radius={15}
-                        fill={selectedIds.has(router.id) ? '#ccffcc' : '#ffffff'}
-                        stroke={router.mode === RouterMode.MeshRoot ? '#0000aa' : '#00aa00'}
-                        strokeWidth={router.mode === RouterMode.MeshRoot ? 3 : 2}
-                    />
-
-                    <Circle
-                        radius={8}
-                        fill={router.mode === RouterMode.MeshNode ? backhaulColor : (router.mode === RouterMode.MeshRoot ? '#0000aa' : '#00aa00')}
-                    />
-
-                    <Text
-                        text={router.ssid}
-                        y={20}
-                        align="center"
-                        fontSize={12}
-                        fill="#000"
-                        offsetX={router.ssid.length * 3}
-                    />
-                    <Text
-                        text={router.mode === RouterMode.MeshRoot ? 'R' : router.mode === RouterMode.MeshNode ? 'N' : 'S'}
-                        align="center"
-                        verticalAlign="middle"
-                        fontSize={10}
-                        fill="#fff"
-                        x={-3}
-                        y={-4}
-                        listening={false}
-                    />
-                  </Group>
-              </React.Fragment>
-              );
+                onMouseEnter={(e) => { if (activeTool === 'select') e.target.getStage()!.container().style.cursor = selected ? 'move' : 'pointer'; }}
+                onMouseLeave={(e) => { if (activeTool === 'select') e.target.getStage()!.container().style.cursor = 'default'; }}
+              >
+                <Rect width={original.width} height={original.height} fill={selected ? '#e8f0ff' : '#eef2f6'} stroke={selected ? '#2563eb' : '#98a2b3'} strokeWidth={selected ? 2 : 1} cornerRadius={5} />
+                <Text text={original.label} width={original.width} height={original.height} align="center" verticalAlign="middle" fontSize={12} fill="#475467" listening={false} />
+              </Group>
+            );
           })}
 
-           {/* Transformer for selected objects */}
-            <Transformer
-                ref={transformerRef}
-                boundBoxFunc={(oldBox, newBox) => {
-                    if (newBox.width < 5 || newBox.height < 5) {
-                        return oldBox;
-                    }
-                    return newBox;
-                }}
-            />
+          {plan.routers.map((original) => {
+            const router = previewRouter(original);
+            const selected = selectedIds.has(original.id);
+            let backhaulColor = '#16a34a';
+            const parentOriginal = original.mode === RouterMode.MeshNode && original.meshParentId ? plan.routers.find((r) => r.id === original.meshParentId) : null;
+            const parent = parentOriginal ? previewRouter(parentOriginal) : null;
+            if (parentOriginal) {
+              const rssi = calculateBackhaulRSSI(original.id, plan);
+              backhaulColor = original.backhaulType === BackhaulType.Wired ? '#344054' : getSignalQualityColor(rssi);
+            }
+            return <React.Fragment key={original.id}>
+              {parent ? <Line points={[parent.x, parent.y, router.x, router.y]} stroke={backhaulColor} strokeWidth={2} dash={original.backhaulType === BackhaulType.Wired ? [] : [7, 6]} listening={false} /> : null}
+              <Group id={original.id} x={router.x} y={router.y} onMouseDown={(e) => beginEntityPointer(original.id, e)}
+                onMouseEnter={(e) => { if (activeTool === 'select') e.target.getStage()!.container().style.cursor = selected ? 'move' : 'pointer'; }}
+                onMouseLeave={(e) => { if (activeTool === 'select') e.target.getStage()!.container().style.cursor = 'default'; }}>
+                {selected ? <Circle radius={25} fill="rgba(37,99,235,.08)" stroke="#2563eb" strokeWidth={1.5} dash={[4, 4]} /> : null}
+                <Circle radius={16} fill="#fff" stroke={original.mode === RouterMode.MeshRoot ? '#1d4ed8' : '#16a34a'} strokeWidth={3} shadowColor="#0f172a" shadowBlur={selected ? 8 : 3} shadowOpacity={.14} />
+                <Circle radius={8} fill={original.mode === RouterMode.MeshNode ? backhaulColor : original.mode === RouterMode.MeshRoot ? '#1d4ed8' : '#16a34a'} />
+                <Text text={original.mode === RouterMode.MeshRoot ? 'R' : original.mode === RouterMode.MeshNode ? 'N' : 'S'} x={-4} y={-5} fontSize={10} fill="#fff" listening={false} />
+                <Label y={23} listening={false}><Tag fill="rgba(255,255,255,.9)" cornerRadius={4} /><Text text={original.ssid} fontSize={11} fill="#344054" padding={4} offsetX={Math.max(0, original.ssid.length * 2.8)} /></Label>
+              </Group>
+            </React.Fragment>;
+          })}
 
-            {/* Selection Box */}
-            {selectionBox && (
-                <Rect
-                    x={selectionBox.x}
-                    y={selectionBox.y}
-                    width={selectionBox.width}
-                    height={selectionBox.height}
-                    fill="rgba(0, 161, 255, 0.3)"
-                    stroke="rgba(0, 161, 255, 0.8)"
-                    strokeWidth={1}
-                />
-            )}
+          <Transformer
+            ref={transformerRef}
+            rotateEnabled
+            borderStroke="#2563eb"
+            anchorStroke="#2563eb"
+            anchorFill="#fff"
+            anchorSize={8}
+            enabledAnchors={['top-left', 'top-right', 'bottom-left', 'bottom-right', 'middle-left', 'middle-right', 'top-center', 'bottom-center']}
+            boundBoxFunc={(oldBox, newBox) => newBox.width < 25 || newBox.height < 25 ? oldBox : newBox}
+          />
 
-          {/* Drawing Preview */}
-          {isDrawing && startPoint && currentPoint && (
-              <>
-             {activeTool === 'wall' && (
-                <Line
-                    points={[startPoint.x, startPoint.y, currentPoint.x, currentPoint.y]}
-                    stroke="#999"
-                    strokeWidth={15}
-                    lineCap="square"
-                    dash={[10, 5]}
-                />
-             )}
-             {activeTool === 'obstacle' && (
-                 <Rect
-                    x={Math.min(startPoint.x, currentPoint.x)}
-                    y={Math.min(startPoint.y, currentPoint.y)}
-                    width={Math.abs(currentPoint.x - startPoint.x)}
-                    height={Math.abs(currentPoint.y - startPoint.y)}
-                    stroke="#999"
-                    strokeWidth={1}
-                    dash={[10, 5]}
-                 />
-             )}
-             </>
-          )}
+          {selectionBounds ? <>
+            <Rect x={selectionBounds.x - 10} y={selectionBounds.y - 10} width={selectionBounds.width + 20} height={selectionBounds.height + 20} stroke="#2563eb" strokeWidth={1.5 / Math.max(scale, .5)} dash={[8 / Math.max(scale, .5), 6 / Math.max(scale, .5)]} listening={false} />
+            <Label x={selectionBounds.x - 10} y={selectionBounds.y - 34 / Math.max(scale, .55)} listening={false}><Tag fill="#2563eb" cornerRadius={5} /><Text text={`${selectedIds.size} selected`} fontSize={11 / Math.max(scale, .75)} fill="#fff" padding={5 / Math.max(scale, .75)} /></Label>
+          </> : null}
 
-          {/* Door Preview */}
-          {activeTool === 'door' && hoveredWallId && doorPreviewPos && (
-             <Circle
-                x={doorPreviewPos.x}
-                y={doorPreviewPos.y}
-                radius={5}
-                fill="green"
-             />
-          )}
+          {selectionBox ? <Rect {...normalizeBox(selectionBox)} fill="rgba(37,99,235,.08)" stroke="#2563eb" strokeWidth={1.4 / Math.max(scale, .5)} dash={[6 / Math.max(scale, .5), 4 / Math.max(scale, .5)]} listening={false} /> : null}
 
-          {/* Tooltip */}
-          {tooltip && (
-              <Label x={tooltip.x} y={tooltip.y} listening={false}>
-                  <Tag fill="black" opacity={0.75} pointerDirection="down" pointerWidth={10} pointerHeight={10} lineJoin="round" shadowColor="black" shadowBlur={10} shadowOffset={{x:10,y:10}} shadowOpacity={0.2}/>
-                  <Text text={tooltip.text} fontFamily="Calibri" fontSize={14} padding={5} fill="white" />
-              </Label>
-          )}
+          {isDrawing && startPoint && currentPoint ? <>
+            {activeTool === 'wall' ? <Line points={[startPoint.x, startPoint.y, currentPoint.x, currentPoint.y]} stroke="#2563eb" strokeWidth={15} opacity={.55} lineCap="square" dash={[12, 7]} listening={false} /> : null}
+            {activeTool === 'room' ? <Rect x={Math.min(startPoint.x, currentPoint.x)} y={Math.min(startPoint.y, currentPoint.y)} width={Math.abs(currentPoint.x - startPoint.x)} height={Math.abs(currentPoint.y - startPoint.y)} stroke="#2563eb" strokeWidth={2} dash={[10, 6]} fill="rgba(37,99,235,.06)" listening={false} /> : null}
+            {activeTool === 'obstacle' ? <Rect x={Math.min(startPoint.x, currentPoint.x)} y={Math.min(startPoint.y, currentPoint.y)} width={Math.abs(currentPoint.x - startPoint.x)} height={Math.abs(currentPoint.y - startPoint.y)} stroke="#2563eb" strokeWidth={1.5} dash={[8, 5]} fill="rgba(37,99,235,.06)" listening={false} /> : null}
+          </> : null}
+
+          {activeTool === 'door' && hoveredWallId && doorPreviewPos ? <Circle x={doorPreviewPos.x} y={doorPreviewPos.y} radius={8 / Math.max(scale, .6)} fill="#fbbf24" stroke="#fff" strokeWidth={2 / Math.max(scale, .6)} listening={false} /> : null}
+
+          {tooltip ? <Label x={tooltip.x} y={tooltip.y} listening={false}><Tag fill="#111827" opacity={.9} cornerRadius={5} /><Text text={tooltip.text} fontSize={11 / Math.max(scale, .72)} padding={5 / Math.max(scale, .72)} fill="#fff" /></Label> : null}
         </Layer>
       </Stage>
     </div>
