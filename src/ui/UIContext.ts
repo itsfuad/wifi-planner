@@ -1,5 +1,47 @@
-import { createContext, useContext } from 'react';
-export type Tool='select'|'room'|'wall'|'door'|'obstacle'|'router';
-export interface UIContextType{activeTool:Tool;setActiveTool:(tool:Tool)=>void;scale:number;setScale:(scale:number)=>void;gridSize:number;setGridSize:(size:number)=>void;selectedIds:Set<string>;setSelectedIds:(ids:Set<string>)=>void;toggleSelection:(id:string)=>void;clearSelection:()=>void;simulationResolution:number;setSimulationResolution:(res:number)=>void;showGrid:boolean;setShowGrid:(value:boolean)=>void;showHeatmap:boolean;setShowHeatmap:(value:boolean)=>void;heatmapOpacity:number;setHeatmapOpacity:(value:number)=>void;liveSimulation:boolean;setLiveSimulation:(value:boolean)=>void;}
-export const UIContext=createContext<UIContextType>({activeTool:'select',setActiveTool:()=>{},scale:1,setScale:()=>{},gridSize:50,setGridSize:()=>{},selectedIds:new Set(),setSelectedIds:()=>{},toggleSelection:()=>{},clearSelection:()=>{},simulationResolution:20,setSimulationResolution:()=>{},showGrid:true,setShowGrid:()=>{},showHeatmap:true,setShowHeatmap:()=>{},heatmapOpacity:.56,setHeatmapOpacity:()=>{},liveSimulation:true,setLiveSimulation:()=>{}});
-export const useUI=()=>useContext(UIContext);
+import { createContext, useContext } from "react";
+export type Tool = "select" | "room" | "wall" | "door" | "obstacle" | "router";
+export interface UIContextType {
+  activeTool: Tool;
+  setActiveTool: (tool: Tool) => void;
+  scale: number;
+  setScale: (scale: number) => void;
+  gridSize: number;
+  setGridSize: (size: number) => void;
+  selectedIds: Set<string>;
+  setSelectedIds: (ids: Set<string>) => void;
+  toggleSelection: (id: string) => void;
+  clearSelection: () => void;
+  simulationResolution: number;
+  setSimulationResolution: (res: number) => void;
+  showGrid: boolean;
+  setShowGrid: (value: boolean) => void;
+  showHeatmap: boolean;
+  setShowHeatmap: (value: boolean) => void;
+  heatmapOpacity: number;
+  setHeatmapOpacity: (value: number) => void;
+  liveSimulation: boolean;
+  setLiveSimulation: (value: boolean) => void;
+}
+export const UIContext = createContext<UIContextType>({
+  activeTool: "select",
+  setActiveTool: () => {},
+  scale: 1,
+  setScale: () => {},
+  gridSize: 50,
+  setGridSize: () => {},
+  selectedIds: new Set(),
+  setSelectedIds: () => {},
+  toggleSelection: () => {},
+  clearSelection: () => {},
+  simulationResolution: 20,
+  setSimulationResolution: () => {},
+  showGrid: true,
+  setShowGrid: () => {},
+  showHeatmap: true,
+  setShowHeatmap: () => {},
+  heatmapOpacity: 0.56,
+  setHeatmapOpacity: () => {},
+  liveSimulation: true,
+  setLiveSimulation: () => {},
+});
+export const useUI = () => useContext(UIContext);

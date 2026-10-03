@@ -1,4 +1,4 @@
-import { WallMaterial, DoorType, ObstacleType } from './types';
+import { WallMaterial, DoorType, ObstacleType } from "./types";
 
 export const WALL_ATTENUATION: Record<WallMaterial, number> = {
   [WallMaterial.Drywall]: 3,

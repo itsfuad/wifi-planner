@@ -4,10 +4,10 @@ export interface Point {
 }
 
 export const WallMaterial = {
-  Drywall: 'drywall',
-  Brick: 'brick',
-  Concrete: 'concrete',
-  Glass: 'glass',
+  Drywall: "drywall",
+  Brick: "brick",
+  Concrete: "concrete",
+  Glass: "glass",
 } as const;
 
 export type WallMaterial = (typeof WallMaterial)[keyof typeof WallMaterial];
@@ -21,9 +21,9 @@ export interface Wall {
 }
 
 export const DoorType = {
-  Wood: 'wood',
-  Glass: 'glass',
-  Metal: 'metal',
+  Wood: "wood",
+  Glass: "glass",
+  Metal: "metal",
 } as const;
 
 export type DoorType = (typeof DoorType)[keyof typeof DoorType];
@@ -37,13 +37,13 @@ export interface Door {
 }
 
 export const ObstacleType = {
-  Bed: 'bed',
-  Sofa: 'sofa',
-  Table: 'table',
-  Wardrobe: 'wardrobe',
-  Fridge: 'fridge',
-  Oven: 'oven',
-  Generic: 'generic',
+  Bed: "bed",
+  Sofa: "sofa",
+  Table: "table",
+  Wardrobe: "wardrobe",
+  Fridge: "fridge",
+  Oven: "oven",
+  Generic: "generic",
 } as const;
 
 export type ObstacleType = (typeof ObstacleType)[keyof typeof ObstacleType];
@@ -60,16 +60,16 @@ export interface Obstacle {
 }
 
 export const RouterMode = {
-    Solo: 'solo',
-    MeshRoot: 'mesh_root',
-    MeshNode: 'mesh_node',
+  Solo: "solo",
+  MeshRoot: "mesh_root",
+  MeshNode: "mesh_node",
 } as const;
 
 export type RouterMode = (typeof RouterMode)[keyof typeof RouterMode];
 
 export const BackhaulType = {
-    Wireless: 'wireless',
-    Wired: 'wired',
+  Wireless: "wireless",
+  Wired: "wired",
 } as const;
 
 export type BackhaulType = (typeof BackhaulType)[keyof typeof BackhaulType];
